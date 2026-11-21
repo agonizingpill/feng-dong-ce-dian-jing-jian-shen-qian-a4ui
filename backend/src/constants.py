@@ -7,4 +7,5 @@ RUN_STATES=('planned','running','completed')
 
 MOUNT_STATES=('draft','accepted')
 BATCH_STATES=('collecting','frozen')
+LIFT_CURVE_STATES=('active','stale')
 DELIVERY_STATES=('submitted','approved','acknowledged')

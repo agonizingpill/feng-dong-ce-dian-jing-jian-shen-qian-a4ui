@@ -13,6 +13,8 @@ from .services import get,pack,pack_layout,pack_sweep,audit,invalidate,assign,ch
 from .middlewares import RequestTrace,BurstGuard
 from .readiness_routes import router as readiness_router
 from .testcycle_routes import router as testcycle_router
+from .lift_routes import router as lift_router
+from . import lift_service
 from .constants import ROLES,ZONES,LAYOUT_STATES
 r=redis.Redis.from_url(os.environ['REDIS_URL'],decode_responses=True)
 @asynccontextmanager
@@ -24,7 +26,7 @@ async def lifespan(app):
             seed()
         except Exception:logging.exception('seed failed')
     yield
-app=FastAPI(title='翼衡 · 风洞测点精简审签',lifespan=lifespan);app.include_router(readiness_router);app.include_router(testcycle_router);app.add_middleware(RequestTrace);app.add_middleware(BurstGuard)
+app=FastAPI(title='翼衡 · 风洞测点精简审签',lifespan=lifespan);app.include_router(readiness_router);app.include_router(testcycle_router);app.include_router(lift_router);app.add_middleware(RequestTrace);app.add_middleware(BurstGuard)
 @app.exception_handler(IntegrityError)
 async def conflict(req,exc):return JSONResponse({'detail':'编号重复、测点重复或关联条件不满足，请核对'},409)
 @app.get('/health')
@@ -82,6 +84,8 @@ def reselect(lid:int,p:Selection,s=Depends(db_session),u=Depends(writers)):
 def sign(lid:int,s=Depends(db_session),u=Depends(admin)):
     l=s.query(Layout).filter_by(id=lid).with_for_update().one_or_none()
     if not l:raise HTTPException(404,'布置方案不存在')
-    check_sign(s,l);l.status='signed';l.signed_by=u.email;audit(s,u,'审签布置 '+l.code);s.commit();return pack_layout(s,l)
+    check_sign(s,l);l.status='signed';l.signed_by=u.email
+    lift_service.seal_model(s,l,u)
+    audit(s,u,'审签布置 '+l.code);s.commit();return pack_layout(s,l)
 @app.get('/audits')
 def audits(s=Depends(db_session),u=Depends(current)):return [pack(x)for x in s.scalars(select(Audit).order_by(Audit.id.desc()).limit(30))]

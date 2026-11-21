@@ -124,3 +124,32 @@ MIT License。
 seed只补基础测点/历史扫角/演示证书，不自动审签或制造合格采样、装夹、回执；按剧本真实操作产生追加数据。重复seed保留人工装夹修订、实际序列、冻结状态、回执和原快照。v1/v2历史证据保留，追加验证在 `../../test-artifacts/gb-1028/v3/`。没有硬件采集接口/实时流/升力反演、自动停机、撤销冻结或真实文档外发；不将人工输入示例解释为真实风洞测试数据。
 
 数据库使用READ COMMITTED，领域状态与父试验行锁继续串行化写入。采集冻结先读取批次再等试验锁，因此冻结汇总必须看到前一持锁事务最新提交的实样；不能沿用MySQL默认REPEATABLE READ在等锁前建立的旧快照。强制持锁2秒的实际并发测试验证：10Pa被重写为99Pa后冻结读到99Pa；完整采集被改成单通道后冻结拒绝，见v3/current-read-race-results.json。
+
+## 实样升力反演与模型封存（v4）
+
+现场只有均压不足以还原气动特性，v4 在不改动九页信息架构的前提下，给通道采集增加“实样→升力曲线”的可追溯反演，并把模型版本、采样版本、冻结与交付快照串成一条证据链。新表 `lift_model_archives` / `lift_curve_versions` 随 `create_all` 自动建立，原表不加列不回填。
+
+**模型封存（布置审签时）**：负责人 `POST /layouts/{id}/sign` 在同一事务内调用 `lift_service.seal_model`，以已签来源的全部扫角（≥40组）在选中通道上拟合一次 `StandardScaler + Ridge(alpha=1.0)`，把 scaler 均值/尺度、Ridge 系数、截距、特征通道真实ID、训练MAE/R²、扫角编号与来源SHA256 封存为 `LiftModelArchive`（每布置唯一、幂等）。此后现场实样只做前向反演，不再重新拟合；开车后的曲线永远沿用这一版系数。升级前已审签但无档案的旧布置，首次刷新曲线时按已冻结来源惰性补封存，结果等价于签时封存。
+
+**同版曲线与缺样对齐**：`POST /acquisition-batches/{id}/lift-curves`（工程师/主管，viewer 只读）按各通道**同一采样位置 k** 对齐：仅当该时刻全部选点都有实样才输出一个曲线点（含逐通道压力与反演升力、时刻 `(k+1)/采样率`），缺样时刻跳过、不插值不补齐，并在 `missing.missing_positions` 逐时刻列出缺失通道；只有每通道实样数都达到 `频率×时长`（无缺样位置）才标记 `complete=true` 并给出整段均压反演升力，缺样时整段升力为 `null`，先出齐全的时刻。
+
+**采样版本即曲线版本**：每次 `PUT .../readings` 改写采样源，事务内立即把该批次全部 active 曲线置 `stale`（记录 superseded_at），旧曲线即刻失效并永久保留；重算只允许 `LiftCurveVersion.version` 递增的新行，迟到重算即使写回 active，也因 `source_checksum` 不等于当前实样而被冻结拒绝，不能盖住新采样。每条曲线带独立的实样 SHA256（按通道、样本数与全部采样值规范化哈希）。同版重复刷新幂等，不新增版本。
+
+**冻结与重算并发**：冻结仍走 `context()` 的试验行锁 + 批次行锁，READ COMMITTED 下 `freeze_guard` 在持锁后重新取数，只认同时满足三条的曲线：存在 active、曲线 checksum 与当前实样一致、`complete=true`。任一不满足即 409，冻结绝不锁定旧快照；冻结后刷新只返回被锁定的同版曲线。
+
+**交付快照**：`TunnelDelivery.snapshot` 在原 run/acquisition 之外追加 `lift_curve`（冻结时的完整曲线版本与缺样清单）和 `lift_model`（封存系数、指标、封存人/时刻、来源SHA），后续源数据再变不影响已发布快照。
+
+|v4接口|权限与动作|
+|---|---|
+|GET /acquisition-batches/{id}/lift-curves|三角色查看该批次全部曲线版本（active/stale）|
+|POST /acquisition-batches/{id}/lift-curves|工程师/主管按当前实样刷新同版曲线，版本递增或幂等返回|
+|GET /lift-model-archives|三角色查看封存模型台账，可按 layout_id 过滤|
+|（接线）POST /layouts/{id}/sign|仅负责人；审签事务内幂等封存反演模型|
+|（接线）POST /acquisition-batches/{id}/freeze|仅主管；新增同版完整曲线门槛|
+|（接线）POST /tunnel-deliveries|快照追加曲线与模型依据|
+
+采集页（08）新增：封存模型前向反演的 SVG 升力曲线、逐通道实样数/均压/缺失率、缺样位置表、曲线版本台账（状态、齐全点、缺样位、生成人、同版校验）、“按当前实样刷新曲线”按钮和冻结门槛提示；采样保存后提示旧版已失效。布置审签页（04）对已签布置展示封存模型指标，交付页（09）展示快照中的曲线与模型依据。`/acquisition-batches` 列表每批附带 `curve` 摘要（含 `stale` 落后标记）。
+
+边界：反演模型是审签来源上的线性简化（Ridge），不替代真实天平/载荷测量；没有时序漂移建模、硬件实时流或自动重算触发，刷新由人员显式发起；缺样不补齐，缺样批次不能冻结也不能交付。
+
+测试：`backend/tests/test_lift_integration.py` 用 SQLite（`DB_ISOLATION_LEVEL=SERIALIZABLE`）+ fakeredis + TestClient 跑 54 项断言，覆盖封存幂等、缺样对齐与时刻语义、版本递增/失效/迟到重算不可覆盖、同版幂等与角色权限、冻结并发改写拒绝（显式刷新读快照模拟 READ COMMITTED 语句级快照）、冻结后锁定、交付快照独立性、旧布置惰性补封存。生产 MySQL 仍固定 READ COMMITTED，`DB_ISOLATION_LEVEL` 仅为本地无 MySQL 测试覆盖。

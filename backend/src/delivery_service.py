@@ -5,6 +5,7 @@ from .run_models import TunnelRun
 from .acquisition_models import AcquisitionBatch
 from .acquisition_service import view as batch_view
 from .delivery_models import TunnelDelivery
+from . import lift_service
 from .calibration_service import locked
 from .services import pack,audit
 
@@ -15,7 +16,12 @@ def create(s,d,u):
     if not b or b.state!='frozen' or not b.summary or b.summary['missing_rate']!=0:raise HTTPException(409,'须完整覆盖通道并由主管冻结采集后交付')
     if not r.snapshot or 'mounting' not in r.snapshot:raise HTTPException(409,'缺少可追溯装夹快照，旧试验不可伪补发布')
     if s.scalar(select(TunnelDelivery.id).where(TunnelDelivery.run_id==r.id)):raise HTTPException(409,'本试验已有交付单，不得重复发布')
-    x=TunnelDelivery(**d.model_dump(),snapshot=deepcopy({'run':pack(r),'acquisition':batch_view(s,b)}));s.add(x);s.flush();audit(s,u,'提交试验交付 '+str(x.id));return pack(x)
+    active_curve=lift_service.active_version(s,b.id)
+    if not active_curve or active_curve.source_checksum!=lift_service.lift_checksum(s,b):raise HTTPException(409,'交付快照须包含与冻结实样同版的升力曲线')
+    snapshot={'run':pack(r),'acquisition':batch_view(s,b),
+              'lift_curve':pack(active_curve),
+              'lift_model':lift_service.archive_view(s,r.layout_id)}
+    x=TunnelDelivery(**d.model_dump(),snapshot=deepcopy(snapshot));s.add(x);s.flush();audit(s,u,'提交试验交付 '+str(x.id));return pack(x)
 def approve(s,id,u):
     x=locked(s,TunnelDelivery,id)
     if x.state!='submitted':raise HTTPException(409,'仅待复核交付可核准，不能重复发布')
